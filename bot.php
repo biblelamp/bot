@@ -1,6 +1,6 @@
 <?php
 // Images Processor Bot
-// version 0.3 last update Jan-17-2016
+// version 0.4 last update Jan-19-2016
 // not less PHP 5.2.1 (file_put_contents(), sys_get_temp_dir())
 
 // script's modes
@@ -118,6 +118,59 @@ class imgClass {
     }
 }
 
+// class for queues
+
+class queClass {
+    private $db;
+    private $queue_name;
+    private $field_name;
+    public function __construct($db, $name, $field, $type) {
+        $this->db = $db;
+        if ((is_array($field))&&(is_array($type))) {
+            for($idx = 0; $idx < count($field); $idx++) {
+                $type[$idx] = $field[$idx] . ' ' . $type[$idx];
+            }
+            $field_type = implode(',', $type);
+            $field = implode(',', $field);
+        } else {
+            $field_type = $field . ' ' . $type;
+        }
+        $this->queue_name = $name;
+        $this->field_name = $field;
+        $db->exec('CREATE TABLE IF NOT EXISTS ' . $this->queue_name . ' (' . $field_type . ')');
+    }
+    public function add($value) {
+        if (is_array($value)) {
+            foreach ($value as &$v) {
+                $v = '\'' . $v . '\'';
+            }
+            $value = implode(',', $value);
+        } else {
+            $value = '\'' . $value . '\'';
+        }
+        $this->db->exec('INSERT INTO ' . $this->queue_name . ' (' . $this->field_name . ') VALUES (' . $value . ')');
+    }
+    public function select() {
+        return $this->db->query('SELECT * FROM ' . $this->queue_name)->fetchAll();
+    }
+    public function show() {
+    	$Results = $this->select();
+		if ($Results) {
+			echo PHP_EOL . DIRECTORY_SEPARATOR . DIRECTORY_SEPARATOR . $this->queue_name . PHP_EOL;
+		}
+		foreach ($Results as $row) {
+            $field_names = explode(',', $this->field_name);
+            foreach($field_names as $name) {
+                echo $row[$name] . ' ';
+            }
+			echo PHP_EOL;
+		}
+    }
+    public function clear() {
+        $this->db->exec('DELETE FROM ' . $this->queue_name);
+    }
+}
+
 // main procedure begin
 
 if ($argc == 1) {
@@ -125,20 +178,20 @@ if ($argc == 1) {
 }
 
 $db = new PDO('sqlite:' . dirname(__FILE__) . DIRECTORY_SEPARATOR . $db_name);
-$db->exec('CREATE TABLE IF NOT EXISTS ' . $queue_download . ' (url TEXT NOT NULL)');
-$db->exec('CREATE TABLE IF NOT EXISTS ' . $queue_failed . ' (url TEXT NOT NULL, status VARCHAR(25) NOT NULL)');
-$db->exec('CREATE TABLE IF NOT EXISTS ' . $queue_resize . ' (path TEXT NOT NULL)');
-$db->exec('CREATE TABLE IF NOT EXISTS ' . $queue_done . ' (path TEXT NOT NULL)');
+$queueDownload = new queClass($db, $queue_download, 'url', 'TEXT NOT NULL');
+$queueFailed = new queClass($db, $queue_failed, array('url', 'status'), array('TEXT NOT NULL', 'VARCHAR(25) NOT NULL'));
+$queueResize = new queClass($db, $queue_resize, 'path', 'TEXT NOT NULL');
+$queueDone = new queClass($db, $queue_done, 'path', 'TEXT NOT NULL');
 
 switch ($argv[1]) {
 
 	// clear mode
 
 	case $clear_mode:
-		$db->exec('DELETE FROM ' . $queue_download);
-		$db->exec('DELETE FROM ' . $queue_failed);
-		$db->exec('DELETE FROM ' . $queue_resize);
-		$db->exec('DELETE FROM ' . $queue_done);
+		$queueDownload->clear();
+        $queueFailed->clear();
+		$queueResize->clear();
+		$queueDone->clear();
 		break;
 
     // shedule mode
@@ -154,9 +207,9 @@ switch ($argv[1]) {
 		foreach($Urls as $url) {
             $img_url = new urlClass($url);
 			if ($img_url->isURLexists()) {
-				$db->exec('INSERT INTO ' . $queue_download . ' (url) VALUES (\'' . $img_url->url . '\')');
+                $queueDownload->add($img_url->url);
 			} else {
-				$db->exec('INSERT INTO ' . $queue_failed . ' (url, status) VALUES (\'' . $img_url->url . '\', \'' . $img_url->status . '\')');
+                $queueFailed->add(array($img_url->url, $img_url->status));
             }
 		}
 		echo PHP_EOL . count($Urls). $urls_processed . PHP_EOL;
@@ -166,7 +219,7 @@ switch ($argv[1]) {
 
     case $download_mode:
         $counter = 0;
-		$Results = $db->query('SELECT * FROM ' . $queue_download)->fetchAll();
+        $Results = $queueDownload->select();
 		if (!$Results) {
 			die ($dl_queue_empty);
 		}
@@ -176,21 +229,21 @@ switch ($argv[1]) {
                 $image = new imgClass();
                 $image->load($img_url->url);
                 $image->save(sys_get_temp_dir() . DIRECTORY_SEPARATOR . basename($img_url->url));
-				$db->exec('INSERT INTO ' . $queue_resize . ' (path) VALUES (\'' . sys_get_temp_dir() . DIRECTORY_SEPARATOR . basename($img_url->url) . '\')');
+                $queueResize->add(sys_get_temp_dir() . DIRECTORY_SEPARATOR . basename($img_url->url));
                 $counter++;
             } else {
-                $db->exec('INSERT INTO ' . $queue_failed . ' (url, status) VALUES (\'' . $img_url->url . '\', \'' . $img_url->status . '\')');
+                $queueFailed->add(array($img_url->url, $img_url->status));
             }
         }
         echo PHP_EOL . $counter. $files_download . sys_get_temp_dir() . PHP_EOL;
-        $db->exec('DELETE FROM ' . $queue_download);
+        $queueDownload->clear();
         break;
 
     // resize mode
 
     case $resize_mode:
 		$counter = 0;
-		$Results = $db->query('SELECT * FROM ' . $queue_resize)->fetchAll();
+		$Results = $queueResize->select();
 		if (!$Results) {
 			die ($rs_queue_empty);
 		}
@@ -200,47 +253,23 @@ switch ($argv[1]) {
                 $image->load($img['path']);
                 $image->resize($new_width, $new_height);
                 $image->save(basename($img['path']));
-				$db->exec('INSERT INTO ' . $queue_done . ' (path) VALUES (\'' . basename($img['path']) . '\')');
+                $queueDone->add(basename($img['path']));
                 $counter++;
             } else {
-				$db->exec('INSERT INTO ' . $queue_failed . ' (url, status) VALUES (\'' . $img['path'] . '\', \'' . $error_file_not_exists . '\')');
+                $queueFailed->add(array($img['path'], $error_file_not_exists));
             }
         }
         echo PHP_EOL . $counter . $files_resized . PHP_EOL;
-        $db->exec('DELETE FROM ' . $queue_resize);
+        $queueResize->clear();
         break;
 
 	// list mode
 
 	case $list_mode:
-		$Results = $db->query('SELECT * FROM ' . $queue_download)->fetchAll();
-		if ($Results) {
-			echo PHP_EOL . '::' . $queue_download . PHP_EOL;
-		}
-		foreach ($Results as $row) {
-			echo $row['url'] . PHP_EOL;
-		}
-		$Results = $db->query('SELECT * FROM ' . $queue_failed)->fetchAll();
-		if ($Results) {
-			echo PHP_EOL . '::' . $queue_failed . PHP_EOL;
-		}
-		foreach ($Results as $row) {
-			echo $row['url'] . ' ' . $row['status'] . PHP_EOL;
-		}
-		$Results = $db->query('SELECT * FROM ' . $queue_resize)->fetchAll();
-		if ($Results) {
-			echo PHP_EOL . '::' . $queue_resize . PHP_EOL;
-		}
-		foreach ($Results as $row) {
-			echo $row['path'] . PHP_EOL;
-		}
-		$Results = $db->query('SELECT * FROM ' . $queue_done)->fetchAll();
-		if ($Results) {
-			echo PHP_EOL . '::' . $queue_done . PHP_EOL;
-		}
-		foreach ($Results as $row) {
-			echo $row['path'] . PHP_EOL;
-		}
+        $queueDownload->show();
+        $queueFailed->show();
+        $queueResize->show();
+        $queueDone->show();
 		break;
 
     default:
